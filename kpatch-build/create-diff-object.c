@@ -82,7 +82,6 @@ enum loglevel loglevel = NORMAL;
 struct special_section {
 	char *name;
 	int (*group_size)(struct kpatch_elf *kelf, int offset);
-	int unsupported;
 };
 
 /*************
@@ -237,6 +236,15 @@ static void kpatch_detect_child_functions(struct kpatch_elf *kelf)
 	}
 }
 
+static bool is_dynamic_debug_symbol(struct symbol *sym)
+{
+	if (sym->type == STT_OBJECT && !strcmp(sym->sec->name, "__verbose"))
+		return true;
+	if (sym->type == STT_SECTION && !strcmp(sym->name, "__verbose"))
+		return true;
+	return false;
+}
+
 /*
  * This function detects whether the given symbol is a "special" static local
  * variable (for lack of a better term).
@@ -249,7 +257,6 @@ static int is_special_static(struct symbol *sym)
 	static char *prefixes[] = {
 		"__key.",
 		"__warned.",
-		"descriptor.",
 		"__func__.",
 		"__FUNCTION__.",
 		"_rs.",
@@ -261,12 +268,12 @@ static int is_special_static(struct symbol *sym)
 	if (!sym)
 		return 0;
 
-	if (sym->type == STT_SECTION) {
-		/* __verbose section contains the descriptor variables */
-		if (!strcmp(sym->name, "__verbose"))
-			return 1;
+	/* pr_debug() uses static local variables in the __verbose section */
+	if (is_dynamic_debug_symbol(sym))
+		return 1;
 
-		/* otherwise make sure section is bundled */
+	if (sym->type == STT_SECTION) {
+		/* make sure section is bundled */
 		if (!sym->sec->sym)
 			return 0;
 
@@ -290,6 +297,13 @@ static int is_special_static(struct symbol *sym)
  */
 static int kpatch_mangled_strcmp(char *s1, char *s2)
 {
+	/*
+	 * ELF string sections aren't mangled, though they look that way.  Just
+	 * compare them normally.
+	 */
+	if (strstr(s1, ".str1."))
+		return strcmp(s1, s2);
+
 	while (*s1 == *s2) {
 		if (!*s1)
 			return 0;
@@ -373,17 +387,16 @@ static int rela_equal(struct rela *rela1, struct rela *rela2)
 	if (!rela_toc1 && !rela_toc2)
 		return toc_data1 == toc_data2;
 
+	if (!rela_toc1 || !rela_toc2)
+		return 0;
+
 	if (rela_toc1->string)
 		return rela_toc2->string && !strcmp(rela_toc1->string, rela_toc2->string);
 
 	if (rela_toc1->addend != rela_toc2->addend)
 		return 0;
 
-	if (is_special_static(rela_toc1->sym))
-		return !kpatch_mangled_strcmp(rela_toc1->sym->name,
-					      rela_toc2->sym->name);
-
-	return !strcmp(rela_toc1->sym->name, rela_toc2->sym->name);
+	return !kpatch_mangled_strcmp(rela_toc1->sym->name, rela_toc2->sym->name);
 }
 
 static void kpatch_compare_correlated_rela_section(struct section *sec)
@@ -433,7 +446,7 @@ static void kpatch_compare_correlated_section(struct section *sec)
 	    sec1->sh.sh_entsize != sec2->sh.sh_entsize ||
 	    (sec1->sh.sh_addralign != sec2->sh.sh_addralign &&
 	     !is_text_section(sec1)))
-		DIFF_FATAL("%s section header details differ", sec1->name);
+		DIFF_FATAL("%s section header details differ from %s", sec1->name, sec2->name);
 
 	/* Short circuit for mcount sections, we rebuild regardless */
 	if (!strcmp(sec->name, ".rela__mcount_loc") ||
@@ -753,7 +766,8 @@ static void kpatch_correlate_sections(struct list_head *seclist1, struct list_he
 
 	list_for_each_entry(sec1, seclist1, list) {
 		list_for_each_entry(sec2, seclist2, list) {
-			if (strcmp(sec1->name, sec2->name))
+			if (kpatch_mangled_strcmp(sec1->name, sec2->name) ||
+			    sec2->twin)
 				continue;
 
 			if (is_special_static(is_rela_section(sec1) ?
@@ -787,8 +801,8 @@ static void kpatch_correlate_symbols(struct list_head *symlist1, struct list_hea
 
 	list_for_each_entry(sym1, symlist1, list) {
 		list_for_each_entry(sym2, symlist2, list) {
-			if (strcmp(sym1->name, sym2->name) ||
-			    sym1->type != sym2->type)
+			if (kpatch_mangled_strcmp(sym1->name, sym2->name) ||
+			    sym1->type != sym2->type || sym2->twin)
 				continue;
 
 			if (is_special_static(sym1))
@@ -881,77 +895,6 @@ static void kpatch_mark_grouped_sections(struct kpatch_elf *kelf)
 			          sec->name, sec->index);
 			data++;
 		}
-	}
-}
-
-/*
- * When gcc makes compiler optimizations which affect a function's calling
- * interface, it mangles the function's name.  For example, sysctl_print_dir is
- * renamed to sysctl_print_dir.isra.2.  The problem is that the trailing number
- * is chosen arbitrarily, and the patched version of the function may end up
- * with a different trailing number.  Rename any mangled patched functions to
- * match their base counterparts.
- */
-static void kpatch_rename_mangled_functions(struct kpatch_elf *base,
-					    struct kpatch_elf *patched)
-{
-	struct symbol *sym, *basesym;
-	char name[256], *origname;
-	struct section *sec, *basesec;
-	int found;
-
-	list_for_each_entry(sym, &patched->symbols, list) {
-		if (sym->type != STT_FUNC)
-			continue;
-
-		if (!strstr(sym->name, ".isra.") &&
-		    !strstr(sym->name, ".constprop.") &&
-		    !strstr(sym->name, ".cold.") &&
-		    !strstr(sym->name, ".part."))
-			continue;
-
-		found = 0;
-		list_for_each_entry(basesym, &base->symbols, list) {
-			if (!kpatch_mangled_strcmp(basesym->name, sym->name)) {
-				found = 1;
-				break;
-			}
-		}
-
-		if (!found)
-			continue;
-
-		if (!strcmp(sym->name, basesym->name))
-			continue;
-
-		log_debug("renaming %s to %s\n", sym->name, basesym->name);
-		origname = sym->name;
-		sym->name = strdup(basesym->name);
-
-		if (sym != sym->sec->sym)
-			continue;
-
-		sym->sec->name = strdup(basesym->sec->name);
-		if (sym->sec->rela)
-			sym->sec->rela->name = strdup(basesym->sec->rela->name);
-
-		/*
-		 * When function foo.isra.1 has a switch statement, it might
-		 * have a corresponding bundled .rodata.foo.isra.1 section (in
-		 * addition to .text.foo.isra.1 which we renamed above).
-		 */
-		sprintf(name, ".rodata.%s", origname);
-		sec = find_section_by_name(&patched->sections, name);
-		if (!sec)
-			continue;
-		sprintf(name, ".rodata.%s", basesym->name);
-		basesec = find_section_by_name(&base->sections, name);
-		if (!basesec)
-			continue;
-		sec->name = strdup(basesec->name);
-		sec->secsym->name = sec->name;
-		if (sec->rela)
-			sec->rela->name = strdup(basesec->rela->name);
 	}
 }
 
@@ -1117,8 +1060,8 @@ static void kpatch_correlate_static_local_variables(struct kpatch_elf *base,
 			if (bundled != patched_bundled)
 				ERROR("bundle mismatch for symbol %s", sym->name);
 			if (!bundled && sym->sec->twin != patched_sym->sec)
-				ERROR("sections %s and %s aren't correlated",
-				      sym->sec->name, patched_sym->sec->name);
+				ERROR("sections %s and %s aren't correlated for symbol %s",
+				      sym->sec->name, patched_sym->sec->name, sym->name);
 
 			log_debug("renaming and correlating static local %s to %s\n",
 				  patched_sym->name, sym->name);
@@ -1229,12 +1172,17 @@ static void kpatch_compare_correlated_elements(struct kpatch_elf *kelf)
 }
 
 #ifdef __x86_64__
-static void rela_insn(struct section *sec, struct rela *rela, struct insn *insn)
+static void rela_insn(const struct section *sec, const struct rela *rela,
+		      struct insn *insn)
 {
 	unsigned long insn_addr, start, end, rela_addr;
 
 	start = (unsigned long)sec->base->data->d_buf;
 	end = start + sec->base->sh.sh_size;
+
+	if (end <= start)
+		ERROR("bad section size");
+
 	rela_addr = start + rela->offset;
 	for (insn_addr = start; insn_addr < end; insn_addr += insn->length) {
 		insn_init(insn, (void *)insn_addr, 1);
@@ -1248,6 +1196,28 @@ static void rela_insn(struct section *sec, struct rela *rela, struct insn *insn)
 	}
 }
 #endif
+
+static bool is_callback_section(struct section *sec) {
+
+	static char *callback_sections[] = {
+		".kpatch.callbacks.pre_patch",
+		".kpatch.callbacks.post_patch",
+		".kpatch.callbacks.pre_unpatch",
+		".kpatch.callbacks.post_unpatch",
+		".rela.kpatch.callbacks.pre_patch",
+		".rela.kpatch.callbacks.post_patch",
+		".rela.kpatch.callbacks.pre_unpatch",
+		".rela.kpatch.callbacks.post_unpatch",
+		NULL,
+	};
+	char **callback_sec;
+
+	for (callback_sec = callback_sections; *callback_sec; callback_sec++)
+		if (!strcmp(sec->name, *callback_sec))
+			return true;
+
+	return false;
+}
 
 /*
  * Mangle the relas a little.  The compiler will sometimes use section symbols
@@ -1272,15 +1242,26 @@ static void kpatch_replace_sections_syms(struct kpatch_elf *kelf)
 
 		list_for_each_entry(rela, &sec->relas, list) {
 
-			if (rela->sym->type != STT_SECTION)
+			if (rela->sym->type != STT_SECTION || !rela->sym->sec)
 				continue;
 
 			/*
 			 * Replace references to bundled sections with their
 			 * symbols.
 			 */
-			if (rela->sym->sec && rela->sym->sec->sym) {
+			if (rela->sym->sec->sym) {
 				rela->sym = rela->sym->sec->sym;
+
+				/*
+				 * On ppc64le with GCC6+, even with
+				 * -ffunction-sections, the function symbol
+				 *  starts 8 bytes past the beginning of the
+				 *  section, because the .TOC pointer is at the
+				 *  beginning, right before the code.  So even
+				 *  though the symbol is bundled, we can't
+				 *  assume it's at offset 0 in the section.
+				 */
+				rela->addend -= rela->sym->sym.st_value;
 
 				continue;
 			}
@@ -1531,57 +1512,28 @@ static int kpatch_include_callback_elements(struct kpatch_elf *kelf)
 	struct rela *rela;
 	int found = 0;
 
-	static char *callback_sections[] = {
-		".kpatch.callbacks.pre_patch",
-		".kpatch.callbacks.post_patch",
-		".kpatch.callbacks.pre_unpatch",
-		".kpatch.callbacks.post_unpatch",
-		".rela.kpatch.callbacks.pre_patch",
-		".rela.kpatch.callbacks.post_patch",
-		".rela.kpatch.callbacks.pre_unpatch",
-		".rela.kpatch.callbacks.post_unpatch",
-		NULL,
-	};
-	char **callback_section;
-
 	/* include load/unload sections */
 	list_for_each_entry(sec, &kelf->sections, list) {
+		if (!is_callback_section(sec))
+			continue;
 
-		for (callback_section = callback_sections; *callback_section; callback_section++) {
-
-			if (strcmp(*callback_section, sec->name))
-				continue;
-
-			sec->include = 1;
-			found = 1;
-			if (is_rela_section(sec)) {
-				/* include callback dependencies */
-				rela = list_entry(sec->relas.next,
-			                         struct rela, list);
-				sym = rela->sym;
-				log_normal("found callback: %s\n",sym->name);
-				kpatch_include_symbol(sym);
-				/* strip the callback symbol */
-				sym->include = 0;
-				sym->sec->sym = NULL;
-				/* use section symbol instead */
-				rela->sym = sym->sec->secsym;
-			} else {
-				sec->secsym->include = 1;
-			}
+		sec->include = 1;
+		found = 1;
+		if (is_rela_section(sec)) {
+			/* include callback dependencies */
+			rela = list_entry(sec->relas.next, struct rela, list);
+			sym = rela->sym;
+			log_normal("found callback: %s\n",sym->name);
+			kpatch_include_symbol(sym);
+		} else {
+			sec->secsym->include = 1;
 		}
 	}
 
 	/* Strip temporary global structures used by the callback macros. */
 	list_for_each_entry(sym, &kelf->symbols, list) {
-		if (!sym->sec)
-			continue;
-		for (callback_section = callback_sections; *callback_section; callback_section++) {
-			if (!strcmp(*callback_section, sym->sec->name)) {
-				sym->include = 0;
-				break;
-			}
-		}
+		if (sym->sec && is_callback_section(sym->sec))
+			sym->include = 0;
 	}
 
 	return found;
@@ -1773,6 +1725,21 @@ static int ex_table_group_size(struct kpatch_elf *kelf, int offset)
 	return size;
 }
 
+static int jump_table_group_size(struct kpatch_elf *kelf, int offset)
+{
+	static int size = 0;
+	char *str;
+
+	if (!size) {
+		str = getenv("JUMP_STRUCT_SIZE");
+		if (!str)
+			ERROR("JUMP_STRUCT_SIZE not set");
+		size = atoi(str);
+	}
+
+	return size;
+}
+
 #ifdef __x86_64__
 static int parainstructions_group_size(struct kpatch_elf *kelf, int offset)
 {
@@ -1878,6 +1845,8 @@ static int fixup_group_size(struct kpatch_elf *kelf, int offset)
 		/* last group */
 		struct section *fixupsec;
 		fixupsec = find_section_by_name(&kelf->sections, ".fixup");
+		if (!fixupsec)
+			ERROR("missing .fixup section");
 		return fixupsec->sh.sh_size - offset;
 	}
 
@@ -1897,6 +1866,10 @@ static struct special_section special_sections[] = {
 		.name		= "__ex_table", /* must come after .fixup */
 		.group_size	= ex_table_group_size,
 	},
+	{
+		.name		= "__jump_table",
+		.group_size	= jump_table_group_size,
+	},
 #ifdef __x86_64__
 	{
 		.name		= ".smp_locks",
@@ -1915,27 +1888,22 @@ static struct special_section special_sections[] = {
 	{
 		.name		= "__ftr_fixup",
 		.group_size	= fixup_entry_group_size,
-		.unsupported	= 1,
 	},
 	{
 		.name		= "__mmu_ftr_fixup",
 		.group_size	= fixup_entry_group_size,
-		.unsupported	= 1,
 	},
 	{
 		.name		= "__fw_ftr_fixup",
 		.group_size	= fixup_entry_group_size,
-		.unsupported	= 1,
 	},
 	{
 		.name		= "__lwsync_fixup",
 		.group_size	= fixup_lwsync_group_size,
-		.unsupported	= 1,
 	},
 	{
 		.name		= "__barrier_nospec_fixup",
 		.group_size	= fixup_barrier_nospec_group_size,
-		.unsupported	= 1,
 	},
 #endif
 	{},
@@ -1994,6 +1962,7 @@ static void kpatch_regenerate_special_section(struct kpatch_elf *kelf,
 	struct rela *rela, *safe;
 	char *src, *dest;
 	unsigned int group_size, src_offset, dest_offset, include;
+	int jump_table = !strcmp(special->name, "__jump_table");
 
 	LIST_HEAD(newrelas);
 
@@ -2011,7 +1980,6 @@ static void kpatch_regenerate_special_section(struct kpatch_elf *kelf,
 		}
 	}
 
-	group_size = 0;
 	src_offset = 0;
 	dest_offset = 0;
 	for ( ; src_offset < sec->base->sh.sh_size; src_offset += group_size) {
@@ -2034,8 +2002,48 @@ static void kpatch_regenerate_special_section(struct kpatch_elf *kelf,
 		if (!include)
 			continue;
 
-		if (special->unsupported)
-			DIFF_FATAL("unsupported reference to special section %s", sec->base->name);
+		/*
+		 * Jump labels (aka static keys or static branches) aren't
+		 * actually supported for the time being.  Warn on all
+		 * non-tracepoint jump labels when they occur in a replacement
+		 * function.  An inert tracepoint is harmless enough, but a
+		 * broken static key can cause unexpected behavior.
+		 *
+		 * Here we hard-code knowledge about the contents of the
+		 * jump_label struct.  It has three fields: code, target, and
+		 * key.
+		 */
+		if (jump_table) {
+			struct rela *code, *key;
+			int i = 0;
+
+			list_for_each_entry(rela, &sec->relas, list) {
+				if (rela->offset >= src_offset &&
+				    rela->offset < src_offset + group_size) {
+					if (i == 0)
+						code = rela;
+					else if (i == 2)
+						key = rela;
+					i++;
+				}
+			}
+
+			if (i != 3)
+				ERROR("BUG: __jump_table has an unexpected format");
+
+			/* inert tracepoints are harmless */
+			if (!strncmp(key->sym->name, "__tracepoint_", 13))
+				continue;
+
+			/* inert dynamic debug printks are harmless */
+			if (is_dynamic_debug_symbol(key->sym))
+				continue;
+
+			ERROR("Found a jump label at %s()+0x%x, using key %s.  Jump labels aren't currently supported.  Use static_key_enabled() instead.",
+			      code->sym->name, code->addend, key->sym->name);
+
+			continue;
+		}
 
 		/*
 		 * Copy all relas in the group.  It's possible that the relas
@@ -2115,6 +2123,9 @@ static void kpatch_regenerate_orc_sections(struct kpatch_elf *kelf)
 	if (!str)
 		return;
 	orc_entry_size = atoi(str);
+
+	if (!orc_entry_size)
+		ERROR("bad ORC_STRUCT_SIZE");
 
 	LIST_HEAD(newrelas);
 
@@ -2346,15 +2357,13 @@ static void kpatch_mark_ignored_functions_same(struct kpatch_elf *kelf)
 static void kpatch_create_kpatch_arch_section(struct kpatch_elf *kelf, char *objname)
 {
 	struct special_section *special;
-	struct kpatch_arch *entries;
 	struct symbol *strsym;
 	struct section *sec, *karch_sec;
 	struct rela *rela;
 	int nr, index = 0;
 
 	nr = sizeof(special_sections) / sizeof(special_sections[0]);
-	karch_sec = create_section_pair(kelf, ".kpatch.arch", sizeof(*entries), nr);
-	entries = karch_sec->data->d_buf;
+	karch_sec = create_section_pair(kelf, ".kpatch.arch", sizeof(struct kpatch_arch), nr);
 
 	/* lookup strings symbol */
 	strsym = find_symbol_by_name(&kelf->symbols, ".kpatch.strings");
@@ -2375,7 +2384,7 @@ static void kpatch_create_kpatch_arch_section(struct kpatch_elf *kelf, char *obj
 		rela->sym = sec->secsym;
 		rela->type = ABSOLUTE_RELA_TYPE;
 		rela->addend = 0;
-		rela->offset = index * sizeof(*entries) + \
+		rela->offset = index * sizeof(struct kpatch_arch) + \
 			       offsetof(struct kpatch_arch, sec);
 
 		/* entries[index].objname */
@@ -2383,7 +2392,7 @@ static void kpatch_create_kpatch_arch_section(struct kpatch_elf *kelf, char *obj
 		rela->sym = strsym;
 		rela->type = ABSOLUTE_RELA_TYPE;
 		rela->addend = offset_of_string(&kelf->strings, objname);
-		rela->offset = index * sizeof(*entries) + \
+		rela->offset = index * sizeof(struct kpatch_arch) + \
 			       offsetof(struct kpatch_arch, objname);
 
 		index++;
@@ -3045,7 +3054,7 @@ static void kpatch_create_mcount_sections(struct kpatch_elf *kelf)
 	struct section *sec, *relasec;
 	struct symbol *sym;
 	struct rela *rela;
-	void **funcs, *newdata;
+	void *newdata;
 	unsigned char *insn;
 
 	nr = 0;
@@ -3055,9 +3064,8 @@ static void kpatch_create_mcount_sections(struct kpatch_elf *kelf)
 			nr++;
 
 	/* create text/rela section pair */
-	sec = create_section_pair(kelf, "__mcount_loc", sizeof(*funcs), nr);
+	sec = create_section_pair(kelf, "__mcount_loc", sizeof(void*), nr);
 	relasec = sec->rela;
-	funcs = sec->data->d_buf;
 
 	/* populate sections */
 	index = 0;
@@ -3076,13 +3084,16 @@ static void kpatch_create_mcount_sections(struct kpatch_elf *kelf)
 		rela->sym = sym;
 		rela->type = R_X86_64_64;
 		rela->addend = 0;
-		rela->offset = index * sizeof(*funcs);
+		rela->offset = index * sizeof(void*);
 
 		/*
 		 * Modify the first instruction of the function to "callq
 		 * __fentry__" so that ftrace will be happy.
 		 */
 		newdata = malloc(sym->sec->data->d_size);
+		if (!newdata)
+			ERROR("malloc");
+
 		memcpy(newdata, sym->sec->data->d_buf, sym->sec->data->d_size);
 		sym->sec->data->d_buf = newdata;
 		insn = newdata;
@@ -3197,6 +3208,60 @@ static void kpatch_build_strings_section_data(struct kpatch_elf *kelf)
 	}
 }
 
+/*
+ * Don't allow sibling calls from patched functions on ppc64le.  Before doing a
+ * sibling call, the patched function restores the stack to its caller's stack.
+ * The kernel-generated stub then writes the patch module's r2 (toc) value to
+ * the caller's stack, corrupting it, eventually causing a panic after it
+ * returns to the caller and the caller tries to use the livepatch module's toc
+ * value.
+ *
+ * In theory we could instead a) generate a custom stub, or b) modify the
+ * kernel livepatch_handler code to save/restore the stack r2 value, but this
+ * is easier for now.
+ */
+static void kpatch_no_sibling_calls_ppc64le(struct kpatch_elf *kelf)
+{
+#ifdef __powerpc64__
+	struct symbol *sym;
+	unsigned int insn;
+	unsigned long offset;
+
+	list_for_each_entry(sym, &kelf->symbols, list) {
+		if (sym->type != STT_FUNC || sym->status != CHANGED)
+			continue;
+
+		for (offset = 0; offset < sym->sec->data->d_size; offset += 4) {
+
+			insn = *(unsigned int *)(sym->sec->data->d_buf + offset);
+
+			/*
+			 * The instruction 0x48000000 can be assumed to be a
+			 * sibling call:
+			 *
+			 * Bits 0-5 (opcode) == 0x9: unconditional branch
+			 * Bit 30 (absolute) == 0: relative address
+			 * Bit 31 (link) == 0: doesn't set LR (not a call)
+			 *
+			 * Bits 6-29 (branch address) == zero, which means
+			 * it's either a branch to self (infinite loop), or
+			 * there's a REL24 relocation for the address which
+			 * will be written by the linker or the kernel.
+			 */
+			if (insn != 0x48000000)
+				continue;
+
+			/* Make sure it's not a branch-to-self: */
+			if (!find_rela_by_offset(sym->sec->rela, offset))
+				continue;
+
+			ERROR("Found an unsupported sibling call at %s()+0x%lx.  Add __attribute__((optimize(\"-fno-optimize-sibling-calls\"))) to %s() definition.",
+			      sym->name, sym->sym.st_value + offset, sym->name);
+		}
+	}
+#endif
+}
+
 struct arguments {
 	char *args[7];
 	int debug;
@@ -3271,15 +3336,15 @@ int main(int argc, char *argv[])
 	kelf_base = kpatch_elf_open(orig_obj);
 	kelf_patched = kpatch_elf_open(patched_obj);
 
+	kpatch_compare_elf_headers(kelf_base->elf, kelf_patched->elf);
+	kpatch_check_program_headers(kelf_base->elf);
+	kpatch_check_program_headers(kelf_patched->elf);
+
 	kpatch_bundle_symbols(kelf_base);
 	kpatch_bundle_symbols(kelf_patched);
 
 	kpatch_detect_child_functions(kelf_base);
 	kpatch_detect_child_functions(kelf_patched);
-
-	kpatch_compare_elf_headers(kelf_base->elf, kelf_patched->elf);
-	kpatch_check_program_headers(kelf_base->elf);
-	kpatch_check_program_headers(kelf_patched->elf);
 
 	list_for_each_entry(sym, &kelf_base->symbols, list) {
 		if (sym->type == STT_FILE) {
@@ -3297,7 +3362,6 @@ int main(int argc, char *argv[])
 	kpatch_mark_grouped_sections(kelf_patched);
 	kpatch_replace_sections_syms(kelf_base);
 	kpatch_replace_sections_syms(kelf_patched);
-	kpatch_rename_mangled_functions(kelf_base, kelf_patched);
 
 	kpatch_correlate_elfs(kelf_base, kelf_patched);
 	kpatch_correlate_static_local_variables(kelf_base, kelf_patched);
@@ -3335,6 +3399,7 @@ int main(int argc, char *argv[])
 			log_debug("no changed functions were found, but callbacks exist\n");
 		else {
 			log_debug("no changed functions were found\n");
+			free(hint);
 			return EXIT_STATUS_NO_CHANGE;
 		}
 	}
@@ -3357,6 +3422,8 @@ int main(int argc, char *argv[])
 	}
 	free(base_locals);
 	free(hint);
+
+	kpatch_no_sibling_calls_ppc64le(kelf_out);
 
 	/* create strings, patches, and dynrelas sections */
 	kpatch_create_strings_elements(kelf_out);
@@ -3384,6 +3451,9 @@ int main(int argc, char *argv[])
 	 * buffers from the relas lists.
 	 */
 	symtab = find_section_by_name(&kelf_out->sections, ".symtab");
+	if (!symtab)
+		ERROR("missing .symtab section");
+
 	list_for_each_entry(sec, &kelf_out->sections, list) {
 		if (!is_rela_section(sec))
 			continue;

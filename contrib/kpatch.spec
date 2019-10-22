@@ -1,6 +1,6 @@
 Name: kpatch
 Summary: Dynamic kernel patching
-Version: 0.6.3
+Version: 0.8.0
 License: GPLv2
 Group: System Environment/Kernel
 URL: http://github.com/dynup/kpatch
@@ -93,6 +93,32 @@ rm -rf %{buildroot}
 %{_mandir}/man1/kpatch-build.1*
 
 %changelog
+* Wed Aug 21 2019 Artem Savkov <asavkov@redhat.com> - 0.8.0
+- kpatch.ko atomic replace fixes
+- Fixes for potential problems found by covscan
+- Remove manual signaling logic from kpatch utility
+- Don't strip callback symbols
+- Allow dynamic debug static keys
+
+* Wed Jul 24 2019 Josh Poimboeuf <jpoimboe@redhat.com> - 0.7.1
+- Fix several powerpc-specific bugs, including two which can result in kernel
+  panics
+- Use rpmbuild --nodeps for installing srpm on Fedora/RHEL
+- Fix inconsistent unit test failures for FAIL tests
+
+* Thu Jul 18 2019 Artem Savkov <asavkov@redhat.com> - 0.7.0
+- Multiple memory leak fixes in kpatch-build
+- livepatch-patch-hook compatability fixes for kernels 5.1+
+- Making kpatch-build compatible with custom gcc names
+- Added rhel-rebased integration tests
+- kpatch.service will no longer unload modules on stop
+- kpatch load will no longer fail if a module is already loaded and enabled
+- kpatch-build will now check for *_fixup section changes on ppc64le and will
+  fail on such changes
+- Add support for R_X86_64_PLT32
+- don't allow jump labels
+- ppc64le-specific kpatch-build fixes
+
 * Fri Apr 12 2019 Joe Lawrence <joe.lawrence@redhat.com> - 0.6.3
 - Lots of integration test work
 - Better support for building out-of-tree modules

@@ -46,10 +46,12 @@ RPMTOPDIR="$CACHEDIR/buildroot"
 VERSIONFILE="$CACHEDIR/version"
 TEMPDIR="$CACHEDIR/tmp"
 LOGFILE="$CACHEDIR/build.log"
+RELEASE_FILE=/etc/os-release
 DEBUG=0
 SKIPCLEANUP=0
 SKIPGCCCHECK=0
 ARCH_KCFLAGS=""
+DEBUG_KCFLAGS=""
 declare -a PATCH_LIST
 APPLIED_PATCHES=0
 OOT_MODULE=
@@ -84,6 +86,33 @@ logger() {
 		# Log only to the logfile
 		cat >> "$LOGFILE"
 	fi
+}
+
+verify_patch_files() {
+	local path
+	local dir
+	local ret=0
+
+	for patch in "${PATCH_LIST[@]}"; do
+		for path in $(lsdiff "$patch" 2>/dev/null); do
+
+			dir=$(dirname "$path")
+			ext="${path##*.}"
+
+			if [[ "$dir" =~ ^lib$ ]] || [[ "$dir" =~ ^lib/ ]] ; then
+				warn "$patch: unsupported patch to lib/: $path"
+				ret=1
+			fi
+
+			if [[ "$ext" == "S" ]] ; then
+				warn "$patch: unsupported patch to assembly: $path"
+				ret=1
+			fi
+
+		done
+	done
+
+	[[ $ret == 1 ]] && die "Unsupported changes detected"
 }
 
 apply_patches() {
@@ -141,7 +170,7 @@ check_pipe_status() {
 			cp core* /tmp
 			die "core file at /tmp/$(ls core*)"
 		fi
-		die "no core file found, run 'ulimit -c unlimited' and try to recreate"
+		die "There was a SIGSEGV, but no core dump was found in the current directory.  Depending on your distro you might find it in /var/lib/systemd/coredump or /var/crash."
 	fi
 }
 
@@ -205,13 +234,18 @@ gcc_version_check() {
 	else
 		kgccver="$(gcc_version_from_file "$VMLINUX")"
 	fi
-	rm -f "$c" "$o"
 
 	if [[ -n "$out" ]]; then
 		warn "gcc >= 4.8 required for -pg -ffunction-settings"
 		echo "gcc output: $out"
 		return 1
 	fi
+
+	out="$(gcc -c -gz=none -o "$o" "$c" 2>&1)"
+	if [[ -z "$out" ]]; then
+		DEBUG_KCFLAGS="-gz=none"
+	fi
+	rm -f "$c" "$o"
 
 	# ensure gcc version matches that used to build the kernel
 	if [[ "$gccver" != "$kgccver" ]]; then
@@ -227,33 +261,40 @@ gcc_version_check() {
 }
 
 find_special_section_data_ppc64le() {
+
+	[[ "$CONFIG_JUMP_LABEL" -eq 0 ]] && AWK_OPTIONS="-vskip_j=1"
+
 	SPECIAL_VARS="$(readelf -wi "$VMLINUX" |
 		gawk --non-decimal-data '
-		BEGIN { f = b = e = 0 }
+		BEGIN { f = b = e = j = 0 }
 
 		# Set state if name matches
 		f == 0 && /DW_AT_name.* fixup_entry[[:space:]]*$/ {f = 1; next}
 		b == 0 && /DW_AT_name.* bug_entry[[:space:]]*$/ {b = 1; next}
 		e == 0 && /DW_AT_name.* exception_table_entry[[:space:]]*$/ {e = 1; next}
+		j == 0 && /DW_AT_name.* jump_entry[[:space:]]*$/ {j = 1; next}
 
 		# Reset state unless this abbrev describes the struct size
 		f == 1 && !/DW_AT_byte_size/ { f = 0; next }
 		b == 1 && !/DW_AT_byte_size/ { b = 0; next }
 		e == 1 && !/DW_AT_byte_size/ { e = 0; next }
+		j == 1 && !/DW_AT_byte_size/ { j = 0; next }
 
 		# Now that we know the size, stop parsing for it
 		f == 1 {printf("export FIXUP_STRUCT_SIZE=%d\n", $4); f = 2}
 		b == 1 {printf("export BUG_STRUCT_SIZE=%d\n", $4); b = 2}
 		e == 1 {printf("export EX_STRUCT_SIZE=%d\n", $4); e = 2}
+		j == 1 {printf("export JUMP_STRUCT_SIZE=%d\n", $4); j = 2}
 
 		# Bail out once we have everything
-		f == 2 && b == 2 && e == 2 {exit}')"
+		f == 2 && b == 2 && e == 2 && (j == 2 || skip_j) {exit}')"
 
 	[[ -n "$SPECIAL_VARS" ]] && eval "$SPECIAL_VARS"
 
 	[[ -z "$FIXUP_STRUCT_SIZE" ]] && die "can't find special struct fixup_entry size"
 	[[ -z "$BUG_STRUCT_SIZE" ]] && die "can't find special struct bug_entry size"
 	[[ -z "$EX_STRUCT_SIZE" ]]  && die "can't find special struct exception_table_entry size"
+	[[ -z "$JUMP_STRUCT_SIZE" && "$CONFIG_JUMP_LABEL" -ne 0 ]]  && die "can't find special struct jump_entry size"
 
 	return
 }
@@ -266,12 +307,13 @@ find_special_section_data() {
 
 	[[ "$CONFIG_PARAVIRT" -eq 0 ]] && AWK_OPTIONS="-vskip_p=1"
 	[[ "$CONFIG_UNWINDER_ORC" -eq 0 ]] && AWK_OPTIONS="$AWK_OPTIONS -vskip_o=1"
+	[[ "$CONFIG_JUMP_LABEL" -eq 0 ]] && AWK_OPTIONS="$AWK_OPTIONS -vskip_j=1"
 
 	# If $AWK_OPTIONS are blank gawk would treat "" as a blank script
 	# shellcheck disable=SC2086
 	SPECIAL_VARS="$(readelf -wi "$VMLINUX" |
 		gawk --non-decimal-data $AWK_OPTIONS '
-		BEGIN { a = b = p = e = o = 0 }
+		BEGIN { a = b = p = e = o = j = 0 }
 
 		# Set state if name matches
 		a == 0 && /DW_AT_name.* alt_instr[[:space:]]*$/ {a = 1; next}
@@ -279,6 +321,7 @@ find_special_section_data() {
 		p == 0 && /DW_AT_name.* paravirt_patch_site[[:space:]]*$/ {p = 1; next}
 		e == 0 && /DW_AT_name.* exception_table_entry[[:space:]]*$/ {e = 1; next}
 		o == 0 && /DW_AT_name.* orc_entry[[:space:]]*$/ {o = 1; next}
+		j == 0 && /DW_AT_name.* jump_entry[[:space:]]*$/ {j = 1; next}
 
 		# Reset state unless this abbrev describes the struct size
 		a == 1 && !/DW_AT_byte_size/ { a = 0; next }
@@ -286,6 +329,7 @@ find_special_section_data() {
 		p == 1 && !/DW_AT_byte_size/ { p = 0; next }
 		e == 1 && !/DW_AT_byte_size/ { e = 0; next }
 		o == 1 && !/DW_AT_byte_size/ { o = 0; next }
+		j == 1 && !/DW_AT_byte_size/ { j = 0; next }
 
 		# Now that we know the size, stop parsing for it
 		a == 1 {printf("export ALT_STRUCT_SIZE=%d\n", $4); a = 2}
@@ -293,9 +337,10 @@ find_special_section_data() {
 		p == 1 {printf("export PARA_STRUCT_SIZE=%d\n", $4); p = 2}
 		e == 1 {printf("export EX_STRUCT_SIZE=%d\n", $4); e = 2}
 		o == 1 {printf("export ORC_STRUCT_SIZE=%d\n", $4); o = 2}
+		j == 1 {printf("export JUMP_STRUCT_SIZE=%d\n", $4); j = 2}
 
 		# Bail out once we have everything
-		a == 2 && b == 2 && (p == 2 || skip_p) && e == 2 && (o == 2 || skip_o) {exit}')"
+		a == 2 && b == 2 && (p == 2 || skip_p) && e == 2 && (o == 2 || skip_o) && (j == 2 || skip_j) {exit}')"
 
 	[[ -n "$SPECIAL_VARS" ]] && eval "$SPECIAL_VARS"
 
@@ -304,8 +349,17 @@ find_special_section_data() {
 	[[ -z "$EX_STRUCT_SIZE" ]]  && die "can't find special struct paravirt_patch_site size"
 	[[ -z "$PARA_STRUCT_SIZE" && "$CONFIG_PARAVIRT" -ne 0 ]] && die "can't find special struct paravirt_patch_site size"
 	[[ -z "$ORC_STRUCT_SIZE" && "$CONFIG_UNWINDER_ORC" -ne 0 ]] && die "can't find special struct orc_entry size"
+	[[ -z "$JUMP_STRUCT_SIZE" && "$CONFIG_JUMP_LABEL" -ne 0 ]] && die "can't find special struct jump_entry size"
 
 	return
+}
+
+filter_parent_obj()
+{
+  local dir="${1}"
+  local file="${2}"
+
+  grep -v "\.mod\.cmd$" | grep -Fv "${dir}/.${file}.cmd"
 }
 
 find_parent_obj() {
@@ -319,17 +373,17 @@ find_parent_obj() {
 	if [[ "$DEEP_FIND" -eq 1 ]]; then
 		num=0
 		if [[ -n "$last_deep_find" ]]; then
-			parent="$(grep -l "$grepname" "$last_deep_find"/.*.cmd | grep -Fv "$pdir/.${file}.cmd" | head -n1)"
-			num="$(grep -l "$grepname" "$last_deep_find"/.*.cmd | grep -Fvc "$pdir/.${file}.cmd")"
+			parent="$(grep -lw "$grepname" "$last_deep_find"/.*.cmd | filter_parent_obj "${pdir}" "${file}" | head -n1)"
+			num="$(grep -lw "$grepname" "$last_deep_find"/.*.cmd | filter_parent_obj "${pdir}" "${file}" | wc -l)"
 		fi
 		if [[ "$num" -eq 0 ]]; then
-			parent="$(find . -name ".*.cmd" -print0 | xargs -0 grep -l "$grepname" | grep -Fv "$pdir/.${file}.cmd" | cut -c3- | head -n1)"
-			num="$(find . -name ".*.cmd" -print0 | xargs -0 grep -l "$grepname" | grep -Fvc "$pdir/.${file}.cmd")"
+			parent="$(find . -name ".*.cmd" -print0 | xargs -0 grep -lw "$grepname" | filter_parent_obj "${pdir}" "${file}" | cut -c3- | head -n1)"
+			num="$(find . -name ".*.cmd" -print0 | xargs -0 grep -lw "$grepname" | filter_parent_obj "${pdir}" "${file}" | wc -l)"
 			[[ "$num" -eq 1 ]] && last_deep_find="$(dirname "$parent")"
 		fi
 	else
-		parent="$(grep -l "$grepname" "$dir"/.*.cmd | grep -Fv "$dir/.${file}.cmd" | head -n1)"
-		num="$(grep -l "$grepname" "$dir"/.*.cmd | grep -Fvc "$dir/.${file}.cmd")"
+		parent="$(grep -lw "$grepname" "$dir"/.*.cmd | filter_parent_obj "${dir}" "${file}" | head -n1)"
+		num="$(grep -lw "$grepname" "$dir"/.*.cmd | filter_parent_obj "${dir}" "${file}" | wc -l)"
 	fi
 
 	[[ "$num" -eq 0 ]] && PARENT="" && return
@@ -339,7 +393,7 @@ find_parent_obj() {
 	PARENT="$(basename "$parent")"
 	PARENT="${PARENT#.}"
 	PARENT="${PARENT%.cmd}"
-	PARENT="$dir/$PARENT"
+	[[ $dir != "." ]] && PARENT="$dir/$PARENT"
 	[[ ! -e "$PARENT" ]] && die "ERROR: can't find parent $PARENT for $1"
 }
 
@@ -551,8 +605,8 @@ fi
 [[ -z "$TARGETS" ]] && TARGETS="vmlinux modules"
 
 # Don't check external file.
-# shellcheck disable=SC1091
-source /etc/os-release
+# shellcheck disable=SC1090
+[[ -f "$RELEASE_FILE" ]] && source "$RELEASE_FILE"
 DISTRO="$ID"
 if [[ "$DISTRO" = fedora ]] || [[ "$DISTRO" = rhel ]] || [[ "$DISTRO" = ol ]] || [[ "$DISTRO" = centos ]]; then
 	[[ -z "$VMLINUX" ]] && VMLINUX="/usr/lib/debug/lib/modules/$ARCHVERSION/vmlinux"
@@ -617,7 +671,7 @@ else
 		echo "Unpacking kernel source"
 
 		rpm -D "_topdir $RPMTOPDIR" -ivh "$SRCRPM" 2>&1 | logger || die
-		rpmbuild -D "_topdir $RPMTOPDIR" -bp "--target=$(uname -m)" "$RPMTOPDIR"/SPECS/kernel$ALT.spec 2>&1 | logger ||
+		rpmbuild -D "_topdir $RPMTOPDIR" -bp --nodeps "--target=$(uname -m)" "$RPMTOPDIR"/SPECS/kernel$ALT.spec 2>&1 | logger ||
 			die "rpmbuild -bp failed.  you may need to run 'yum-builddep kernel' first."
 
 		mv "$RPMTOPDIR"/BUILD/kernel-*/linux-* "$SRCDIR" 2>&1 | logger || die
@@ -714,6 +768,11 @@ if grep -q "CONFIG_UNWINDER_ORC=y" "$CONFIGFILE"; then
 else
 	CONFIG_UNWINDER_ORC=0
 fi
+if grep -q "CONFIG_JUMP_LABEL=y" "$CONFIGFILE"; then
+	CONFIG_JUMP_LABEL=1
+else
+	CONFIG_JUMP_LABEL=0
+fi
 
 # unsupported kernel option checking
 grep -q "CONFIG_DEBUG_INFO_SPLIT=y" "$CONFIGFILE" && die "kernel option 'CONFIG_DEBUG_INFO_SPLIT' not supported"
@@ -722,6 +781,7 @@ grep -q "CONFIG_GCC_PLUGIN_RANDSTRUCT=y" "$CONFIGFILE" && die "kernel option 'CO
 
 echo "Testing patch file(s)"
 cd "$SRCDIR" || die
+verify_patch_files
 apply_patches
 remove_patches
 
@@ -731,7 +791,8 @@ if [[ "$ARCH" = "ppc64le" ]]; then
 	ARCH_KCFLAGS="-mcmodel=large -fplugin=$PLUGINDIR/ppc64le-plugin.so"
 fi
 
-export KCFLAGS="-I$DATADIR/patch -ffunction-sections -fdata-sections $ARCH_KCFLAGS"
+export KCFLAGS="-I$DATADIR/patch -ffunction-sections -fdata-sections \
+		$ARCH_KCFLAGS $DEBUG_KCFLAGS"
 
 echo "Reading special section data"
 find_special_section_data
@@ -935,6 +996,7 @@ if ! "$KPATCH_MODULE"; then
 fi
 
 readelf --wide --symbols "$TEMPDIR/patch/$MODNAME.ko" 2>/dev/null | \
+	sed -r 's/\s+\[<localentry>: 8\]//' | \
 	awk '($4=="FUNC" || $4=="OBJECT") && ($5=="GLOBAL" || $5=="WEAK") && $7!="UND" {print $NF}' \
 	>"${TEMPDIR}"/new_symbols
 

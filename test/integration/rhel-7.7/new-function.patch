@@ -1,8 +1,8 @@
-Index: kernel-rhel7/drivers/tty/n_tty.c
+Index: kernel/drivers/tty/n_tty.c
 ===================================================================
---- kernel-rhel7.orig/drivers/tty/n_tty.c
-+++ kernel-rhel7/drivers/tty/n_tty.c
-@@ -2128,7 +2128,7 @@ do_it_again:
+--- kernel.orig/drivers/tty/n_tty.c
++++ kernel/drivers/tty/n_tty.c
+@@ -2175,7 +2175,7 @@ do_it_again:
   *		  lock themselves)
   */
  
@@ -11,7 +11,7 @@ Index: kernel-rhel7/drivers/tty/n_tty.c
  			   const unsigned char *buf, size_t nr)
  {
  	const unsigned char *b = buf;
-@@ -2210,6 +2210,12 @@ break_out:
+@@ -2264,6 +2264,12 @@ break_out:
  	return (b - buf) ? b - buf : retval;
  }
  
