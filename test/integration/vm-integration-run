@@ -47,6 +47,7 @@ git clone "${KPATCH_GIT}" || exit 1
 
 cd kpatch || exit 1
 
+git fetch origin +refs/pull/*:refs/pull/*
 git reset --hard "${KPATCH_REV}" || exit 1
 
 # shellcheck disable=SC1091
@@ -61,6 +62,12 @@ kpatch_set_ccache_max_size 10G
 if [[ -d "${HOME}/src" && -f "${HOME}/src/version" ]]; then
   cp "${HOME}/src/version" "${HOME}/.kpatch/"
   mv "${HOME}/src" "${HOME}/.kpatch/"
+fi
+
+source /etc/os-release
+
+if [[ "${NAME}" == "Fedora" ]] && [[ "${VERSION_ID}" -lt 30 ]]; then
+  export BUILDMOD=yes
 fi
 
 if [ ${KPATCH_SLOW} -eq 1 ]; then
