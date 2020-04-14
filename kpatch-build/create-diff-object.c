@@ -171,6 +171,32 @@ static int is_gcc6_localentry_bundled_sym(struct symbol *sym)
 }
 #endif
 
+/*
+ * On ppc64le, when a function references data, it does so indirectly, via the
+ * .toc section.  So there are *two* levels of relas:
+ *
+ *   1) the original function rela, referring to the .toc section; and
+ *
+ *   2) the .toc section rela, referring to the data needed by the function.
+ *
+ * For example:
+ *
+ *   Relocation section '.rela.text.netlink_release' at offset 0xcadf0 contains 44 entries:
+ *   ...
+ *   0000000000000398  0000007300000032 R_PPC64_TOC16_HA    0000000000000000 .toc + 138
+ *   00000000000003a0  0000007300000040 R_PPC64_TOC16_LO_DS 0000000000000000 .toc + 138
+ *
+ *   Relocation section '.rela.toc' at offset 0xcc6b0 contains 46 entries:
+ *   ...
+ *   0000000000000138  0000002a00000026 R_PPC64_ADDR64      0000000000000000 .text.deferred_put_nlk_sk + 8
+ *
+ * The below function takes the "first level" rela as input, and, if it refers
+ * to .toc, returns the "second level" rela, which is the one that refers to
+ * the actual data symbol.
+ *
+ * In some rare cases, a .toc entry has constant data, and thus has no
+ * corresponding rela.  In that case, NULL is returned.
+ */
 static struct rela *toc_rela(const struct rela *rela)
 {
 	if (rela->type != R_PPC64_TOC16_HA &&
@@ -209,9 +235,28 @@ static void kpatch_bundle_symbols(struct kpatch_elf *kelf)
 	}
 }
 
+static struct symbol *kpatch_lookup_parent(struct kpatch_elf *kelf,
+					   const char *symname,
+					   const char *child_suffix)
+{
+	struct symbol *parent;
+	char *pname;
+
+	pname = strndup(symname, child_suffix - symname);
+	if (!pname)
+		ERROR("strndup");
+
+	parent = find_symbol_by_name(&kelf->symbols, pname);
+	free(pname);
+
+	return parent;
+}
+
 /*
  * During optimization gcc may move unlikely execution branches into *.cold
- * subfunctions. kpatch_detect_child_functions detects such subfunctions and
+ * subfunctions. Some functions can also be split into multiple *.part
+ * functions.
+ * kpatch_detect_child_functions detects such subfunctions and
  * crossreferences them with their parent functions through parent/child
  * pointers.
  */
@@ -220,24 +265,28 @@ static void kpatch_detect_child_functions(struct kpatch_elf *kelf)
 	struct symbol *sym;
 
 	list_for_each_entry(sym, &kelf->symbols, list) {
-		char *coldstr;
+		char *childstr;
 
-		coldstr = strstr(sym->name, ".cold.");
-		if (coldstr != NULL) {
-			char *pname;
+		if (sym->type != STT_FUNC)
+			continue;
 
-			pname = strndup(sym->name, coldstr - sym->name);
-			if (!pname)
-				ERROR("strndup");
-
-			sym->parent = find_symbol_by_name(&kelf->symbols, pname);
-			free(pname);
-
+		childstr = strstr(sym->name, ".cold.");
+		if (childstr) {
+			sym->parent = kpatch_lookup_parent(kelf, sym->name,
+							   childstr);
 			if (!sym->parent)
-				ERROR("failed to find parent function for %s", sym->name);
-
-			sym->parent->child = sym;
+				ERROR("failed to find parent function for %s",
+				      sym->name);
+		} else {
+			childstr = strstr(sym->name, ".part.");
+			if (!childstr)
+				continue;
+			sym->parent = kpatch_lookup_parent(kelf, sym->name,
+							   childstr);
 		}
+
+		if (sym->parent)
+			list_add_tail(&sym->subfunction_node, &sym->parent->children);
 	}
 }
 
@@ -659,6 +708,26 @@ static int kpatch_line_macro_change_only(struct section *sec)
 }
 #endif
 
+/*
+ * Child functions with "*.cold" names don't have _fentry_ calls, but "*.part",
+ * often do. In the later case, it is not necessary to include the parent
+ * in the output object when the child function has changed.
+ */
+static bool kpatch_changed_child_needs_parent_profiling(struct symbol *sym)
+{
+	struct symbol *child;
+
+	list_for_each_entry(child, &sym->children, subfunction_node) {
+		if (child->has_func_profiling)
+			continue;
+		if (child->sec->status == CHANGED ||
+		    kpatch_changed_child_needs_parent_profiling(child))
+			return true;
+	}
+
+	return false;
+}
+
 static void kpatch_compare_sections(struct list_head *seclist)
 {
 	struct section *sec;
@@ -691,8 +760,8 @@ static void kpatch_compare_sections(struct list_head *seclist)
 			if (sym && sym->status != CHANGED)
 				sym->status = sec->status;
 
-			if (sym && sym->child && sym->status == SAME &&
-			    sym->child->sec->status == CHANGED)
+			if (sym && sym->status == SAME &&
+			    kpatch_changed_child_needs_parent_profiling(sym))
 				sym->status = CHANGED;
 		}
 	}
@@ -712,6 +781,13 @@ static enum subsection kpatch_subsection_type(struct section *sec)
 static int kpatch_subsection_changed(struct section *sec1, struct section *sec2)
 {
 	return kpatch_subsection_type(sec1) != kpatch_subsection_type(sec2);
+}
+
+static struct symbol *kpatch_get_correlated_parent(struct symbol *sym)
+{
+	while (sym->parent && !sym->parent->twin)
+		sym = sym->parent;
+	return sym->parent;
 }
 
 static void kpatch_compare_correlated_symbol(struct symbol *sym)
@@ -965,21 +1041,13 @@ static char *kpatch_section_function_name(struct section *sec)
 	return sec->sym ? sec->sym->name : sec->name;
 }
 
-/*
- * Given a static local variable symbol and a rela section which references it
- * in the base object, find a corresponding usage of a similarly named symbol
- * in the patched object.
- */
-static struct symbol *kpatch_find_static_twin(struct section *sec,
-					      struct symbol *sym)
+static struct symbol *kpatch_find_uncorrelated_rela(struct section *rela_sec,
+						    struct symbol *sym)
 {
 	struct rela *rela, *rela_toc;
 
-	if (!sec->twin)
-		return NULL;
-
 	/* find the patched object's corresponding variable */
-	list_for_each_entry(rela, &sec->twin->relas, list) {
+	list_for_each_entry(rela, &rela_sec->relas, list) {
 		struct symbol *patched_sym;
 
 		rela_toc = toc_rela(rela);
@@ -1005,6 +1073,67 @@ static struct symbol *kpatch_find_static_twin(struct section *sec,
 	return NULL;
 }
 
+static struct symbol *kpatch_find_static_twin_in_children(struct symbol *parent,
+							  struct symbol *sym)
+{
+	struct symbol *child;
+
+	list_for_each_entry(child, &parent->children, subfunction_node) {
+		struct symbol *res;
+
+		/* Only look in children whose rela section differ from the parent's */
+		if (child->sec->rela == parent->sec->rela || !child->sec->rela)
+			continue;
+
+		res = kpatch_find_uncorrelated_rela(child->sec->rela, sym);
+		/* Need to go deeper */
+		if (!res)
+			res = kpatch_find_static_twin_in_children(child, sym);
+		if (res != NULL)
+			return res;
+	}
+
+	return NULL;
+}
+
+/*
+ * Given a static local variable symbol and a rela section which references it
+ * in the base object, find a corresponding usage of a similarly named symbol
+ * in the patched object.
+ */
+static struct symbol *kpatch_find_static_twin(struct section *sec,
+					      struct symbol *sym)
+{
+	struct symbol *res;
+
+	if (!sec->twin && sec->base->sym) {
+		struct symbol *parent = NULL;
+
+		/*
+		 * The static twin might have been in a .part. symbol in the
+		 * original object that got removed in the patched object.
+		 */
+		parent = kpatch_get_correlated_parent(sec->base->sym);
+		if (parent)
+			sec = parent->sec->rela;
+
+	}
+
+	if (!sec->twin)
+		return NULL;
+
+	res = kpatch_find_uncorrelated_rela(sec->twin, sym);
+	if (res != NULL)
+		return res;
+
+	/* Look if reference might have moved to child functions' sections */
+	if (sec->twin->base->sym)
+		return kpatch_find_static_twin_in_children(sec->twin->base->sym,
+							   sym);
+
+	return NULL;
+}
+
 static int kpatch_is_normal_static_local(struct symbol *sym)
 {
 	if (sym->type != STT_OBJECT || sym->bind != STB_LOCAL)
@@ -1017,6 +1146,35 @@ static int kpatch_is_normal_static_local(struct symbol *sym)
 		return 0;
 
 	return 1;
+}
+
+static struct rela *kpatch_find_static_twin_ref(struct section *rela_sec, struct symbol *sym)
+{
+	struct rela *rela;
+
+	list_for_each_entry(rela, &rela_sec->relas, list) {
+		if (rela->sym == sym->twin)
+			return rela;
+	}
+
+	/* Reference to static variable might have moved to child function section */
+	if (rela_sec->base->sym) {
+		struct symbol *parent = rela_sec->base->sym;
+		struct symbol *child;
+
+		list_for_each_entry(child, &parent->children, subfunction_node) {
+			/* Only look in children whose rela section differ from the parent's */
+			if (child->sec->rela == parent->sec->rela ||
+			    !child->sec->rela)
+				continue;
+
+			rela = kpatch_find_static_twin_ref(child->sec->rela, sym);
+			if (rela)
+				return rela;
+		}
+	}
+
+	return NULL;
 }
 
 /*
@@ -1048,8 +1206,8 @@ static void kpatch_correlate_static_local_variables(struct kpatch_elf *base,
 {
 	struct symbol *sym, *patched_sym;
 	struct section *sec;
-	struct rela *rela, *rela2;
-	int bundled, patched_bundled, found;
+	struct rela *rela;
+	int bundled, patched_bundled;
 
 	/*
 	 * First undo the correlations for all static locals.  Two static
@@ -1149,28 +1307,29 @@ static void kpatch_correlate_static_local_variables(struct kpatch_elf *base,
 			continue;
 
 		list_for_each_entry(rela, &sec->relas, list) {
+			struct section *target_sec = sec;
 
 			sym = rela->sym;
 			if (!kpatch_is_normal_static_local(sym))
 				continue;
 
-			if (!sym->twin || !sec->twin)
-				DIFF_FATAL("reference to static local variable %s in %s was removed",
-					   sym->name,
-					   kpatch_section_function_name(sec));
+			if (!sec->twin && sec->base->sym) {
+				struct symbol *parent = NULL;
 
-			found = 0;
-			list_for_each_entry(rela2, &sec->twin->relas, list) {
-				if (rela2->sym == sym->twin) {
-					found = 1;
-					break;
-				}
+				parent = kpatch_get_correlated_parent(sec->base->sym);
+				if (parent)
+					target_sec = parent->sec->rela;
 			}
 
-			if (!found)
+			if (!sym->twin || !target_sec->twin)
+				DIFF_FATAL("reference to static local variable %s in %s was removed",
+					   sym->name,
+					   kpatch_section_function_name(target_sec));
+
+			if (!kpatch_find_static_twin_ref(target_sec->twin, sym))
 				DIFF_FATAL("static local %s has been correlated with %s, but patched %s is missing a reference to it",
 					   sym->name, sym->twin->name,
-					   kpatch_section_function_name(sec->twin));
+					   kpatch_section_function_name(target_sec->twin));
 		}
 	}
 
@@ -1402,7 +1561,8 @@ static void kpatch_check_func_profiling_calls(struct kpatch_elf *kelf)
 	int errs = 0;
 
 	list_for_each_entry(sym, &kelf->symbols, list) {
-		if (sym->type != STT_FUNC || sym->status != CHANGED || sym->parent)
+		if (sym->type != STT_FUNC || sym->status != CHANGED ||
+		    (sym->parent && sym->parent->status == CHANGED))
 			continue;
 		if (!sym->twin->has_func_profiling) {
 			log_normal("function %s has no fentry/mcount call, unable to patch\n",
@@ -2008,6 +2168,7 @@ static void kpatch_regenerate_special_section(struct kpatch_elf *kelf,
 	char *src, *dest;
 	unsigned int group_size, src_offset, dest_offset, include;
 	int jump_table = !strcmp(special->name, "__jump_table");
+	int jump_labels_found = 0;
 
 	LIST_HEAD(newrelas);
 
@@ -2084,9 +2245,9 @@ static void kpatch_regenerate_special_section(struct kpatch_elf *kelf,
 			if (is_dynamic_debug_symbol(key->sym))
 				continue;
 
-			ERROR("Found a jump label at %s()+0x%lx, using key %s.  Jump labels aren't currently supported.  Use static_key_enabled() instead.",
-			      code->sym->name, code->addend, key->sym->name);
-
+			jump_labels_found++;
+			log_normal("Found a jump label at %s+0x%lx, key: %s.\n",
+				   code->sym->name, code->addend, key->sym->name);
 			continue;
 		}
 
@@ -2120,6 +2281,10 @@ static void kpatch_regenerate_special_section(struct kpatch_elf *kelf,
 		memcpy(dest + dest_offset, src + src_offset, group_size);
 		dest_offset += group_size;
 	}
+
+	if (jump_labels_found)
+		ERROR("Found %d jump label(s) in the patched code. Jump labels aren't currently supported. Use static_key_enabled() instead.",
+		      jump_labels_found);
 
 	if (!dest_offset) {
 		/* no changed or global functions referenced */
@@ -2362,6 +2527,16 @@ static void kpatch_mark_ignored_sections_same(struct kpatch_elf *kelf)
 			sym->status = SAME;
 }
 
+static void kpatch_mark_ignored_children_same(struct symbol *sym)
+{
+	struct symbol *child;
+
+	list_for_each_entry(child, &sym->children, subfunction_node) {
+		child->status = SAME;
+		kpatch_mark_ignored_children_same(child);
+	}
+}
+
 static void kpatch_mark_ignored_functions_same(struct kpatch_elf *kelf)
 {
 	struct section *sec;
@@ -2383,8 +2558,7 @@ static void kpatch_mark_ignored_functions_same(struct kpatch_elf *kelf)
 		rela->sym->status = SAME;
 		rela->sym->sec->status = SAME;
 
-		if (rela->sym->child)
-			rela->sym->child->status = SAME;
+		kpatch_mark_ignored_children_same(rela->sym);
 
 		if (rela->sym->sec->secsym)
 			rela->sym->sec->secsym->status = SAME;
@@ -2571,14 +2745,17 @@ static void kpatch_create_patches_sections(struct kpatch_elf *kelf,
 	struct section *sec, *relasec;
 	struct symbol *sym, *strsym;
 	struct rela *rela;
-	struct lookup_result result;
+	struct lookup_result symbol;
 	struct kpatch_patch_func *funcs;
 
 	/* count patched functions */
 	nr = 0;
-	list_for_each_entry(sym, &kelf->symbols, list)
-		if (sym->type == STT_FUNC && sym->status == CHANGED && !sym->parent)
-			nr++;
+	list_for_each_entry(sym, &kelf->symbols, list) {
+		if (sym->type != STT_FUNC || sym->status != CHANGED ||
+		    sym->parent)
+			continue;
+		nr++;
+	}
 
 	/* create text/rela section pair */
 	sec = create_section_pair(kelf, ".kpatch.funcs", sizeof(*funcs), nr);
@@ -2596,72 +2773,69 @@ static void kpatch_create_patches_sections(struct kpatch_elf *kelf,
 	/* populate sections */
 	index = 0;
 	list_for_each_entry(sym, &kelf->symbols, list) {
-		if (sym->type == STT_FUNC && sym->status == CHANGED && !sym->parent) {
-			if (sym->bind == STB_LOCAL) {
-				if (lookup_local_symbol(table, sym->name,
-				                        &result))
-					ERROR("lookup_local_symbol %s",
-					      sym->name);
-			} else {
-				if(lookup_global_symbol(table, sym->name,
-				                        &result))
-					ERROR("lookup_global_symbol %s",
-					      sym->name);
-			}
-			log_debug("lookup for %s @ 0x%016lx len %lu\n",
-			          sym->name, result.value, result.size);
+		if (sym->type != STT_FUNC || sym->status != CHANGED ||
+		    sym->parent)
+			continue;
 
-			/*
-			 * Convert global symbols to local so other objects in
-			 * the patch module (like the patch callback object's init
-			 * code) won't link to this function and call it before
-			 * its relocations have been applied.
-			 */
-			sym->bind = STB_LOCAL;
-			sym->sym.st_info = (unsigned char)
-					   GELF_ST_INFO(sym->bind, sym->type);
+		if (!lookup_symbol(table, sym->name, &symbol))
+			ERROR("can't find symbol '%s' in symbol table", sym->name);
 
-			/* add entry in text section */
-			funcs[index].old_addr = result.value;
-			funcs[index].old_size = result.size;
-			funcs[index].new_size = sym->sym.st_size;
-			funcs[index].sympos = result.pos;
+		if (sym->bind == STB_LOCAL && symbol.global)
+			ERROR("can't find local symbol '%s' in symbol table", sym->name);
 
-			/*
-			 * Add a relocation that will populate
-			 * the funcs[index].new_addr field at
-			 * module load time.
-			 */
-			ALLOC_LINK(rela, &relasec->relas);
-			rela->sym = sym;
-			rela->type = ABSOLUTE_RELA_TYPE;
-			rela->addend = 0;
-			rela->offset = (unsigned int)(index * sizeof(*funcs));
+		log_debug("lookup for %s: obj=%s sympos=%lu size=%lu",
+			  sym->name, symbol.objname, symbol.sympos,
+			  symbol.size);
 
-			/*
-			 * Add a relocation that will populate
-			 * the funcs[index].name field.
-			 */
-			ALLOC_LINK(rela, &relasec->relas);
-			rela->sym = strsym;
-			rela->type = ABSOLUTE_RELA_TYPE;
-			rela->addend = offset_of_string(&kelf->strings, sym->name);
-			rela->offset = (unsigned int)(index * sizeof(*funcs) +
-			               offsetof(struct kpatch_patch_func, name));
+		/*
+		 * Convert global symbols to local so other objects in the
+		 * patch module (like the patch callback object's init code)
+		 * won't link to this function and call it before its
+		 * relocations have been applied.
+		 */
+		sym->bind = STB_LOCAL;
+		sym->sym.st_info = (unsigned char)
+				   GELF_ST_INFO(sym->bind, sym->type);
 
-			/*
-			 * Add a relocation that will populate
-			 * the funcs[index].objname field.
-			 */
-			ALLOC_LINK(rela, &relasec->relas);
-			rela->sym = strsym;
-			rela->type = ABSOLUTE_RELA_TYPE;
-			rela->addend = objname_offset;
-			rela->offset = (unsigned int)(index * sizeof(*funcs) +
-			               offsetof(struct kpatch_patch_func,objname));
+		/* add entry in text section */
+		funcs[index].old_addr = symbol.addr;
+		funcs[index].old_size = symbol.size;
+		funcs[index].new_size = sym->sym.st_size;
+		funcs[index].sympos = symbol.sympos;
 
-			index++;
-		}
+		/*
+		 * Add a relocation that will populate the
+		 * funcs[index].new_addr field at module load time.
+		 */
+		ALLOC_LINK(rela, &relasec->relas);
+		rela->sym = sym;
+		rela->type = ABSOLUTE_RELA_TYPE;
+		rela->addend = 0;
+		rela->offset = (unsigned int)(index * sizeof(*funcs));
+
+		/*
+		 * Add a relocation that will populate the funcs[index].name
+		 * field.
+		 */
+		ALLOC_LINK(rela, &relasec->relas);
+		rela->sym = strsym;
+		rela->type = ABSOLUTE_RELA_TYPE;
+		rela->addend = offset_of_string(&kelf->strings, sym->name);
+		rela->offset = (unsigned int)(index * sizeof(*funcs) +
+			       offsetof(struct kpatch_patch_func, name));
+
+		/*
+		 * Add a relocation that will populate the funcs[index].objname
+		 * field.
+		 */
+		ALLOC_LINK(rela, &relasec->relas);
+		rela->sym = strsym;
+		rela->type = ABSOLUTE_RELA_TYPE;
+		rela->addend = objname_offset;
+		rela->offset = (unsigned int)(index * sizeof(*funcs) +
+			       offsetof(struct kpatch_patch_func,objname));
+
+		index++;
 	}
 
 	/* sanity check, index should equal nr */
@@ -2677,76 +2851,178 @@ static int kpatch_is_core_module_symbol(char *name)
 		!strcmp(name, "kpatch_shadow_get"));
 }
 
-/*
- * If the patched code refers to a symbol, for example, calls a function
- * or stores a pointer to a function somewhere, the address of that symbol
- * must be resolved somehow before the patch is applied. The symbol may be
- * present in the original code too, so the patch may refer either to that
- * version of the symbol (dynrela is used for that) or to its patched
- * version directly (with a normal relocation).
- *
- * Dynrelas may be needed for the symbols not present in this object file
- * (rela->sym->sec is NULL), because it is unknown if the patched versions
- * of these symbols exist and where they are.
- *
- * The patched code can usually refer to a symbol from this object file
- * directly. If it is a function, this may also improve performance because
- * it will not be needed to call the original function first, find the
- * patched one and then use Ftrace to pass control to it.
- *
- * There is an exception though, at least on x86. It is safer to use
- * a dynrela if the patched code stores a pointer to a function somewhere
- * (relocation of type R_X86_64_32S). The function could be used as
- * a callback and some kinds of callbacks are called asynchronously. If
- * the patch module sets such callback and is unloaded shortly after,
- * the kernel could try to call the function via an invalid pointer and
- * would crash. With dynrela, the kernel would call the original function
- * in that case.
- */
 static int function_ptr_rela(const struct rela *rela)
 {
 	const struct rela *rela_toc = toc_rela(rela);
 
 	return (rela_toc && rela_toc->sym->type == STT_FUNC &&
 		!rela_toc->sym->parent &&
-		/* skip switch table on PowerPC */
 		rela_toc->addend == (int)rela_toc->sym->sym.st_value &&
 		(rela->type == R_X86_64_32S ||
 		rela->type == R_PPC64_TOC16_HA ||
 		rela->type == R_PPC64_TOC16_LO_DS));
 }
 
-static int may_need_dynrela(const struct rela *rela)
+static bool need_dynrela(struct lookup_table *table, const struct rela *rela)
 {
+	struct lookup_result symbol;
+
 	/*
-	 * References to .TOC. are treated specially by the module loader and
+	 * These references are treated specially by the module loader and
 	 * should never be converted to dynrelas.
 	 */
 	if (rela->type == R_PPC64_REL16_HA || rela->type == R_PPC64_REL16_LO ||
-	    rela->type == R_PPC64_REL64)
-		return 0;
-
-	if (!rela->sym->sec)
-		return 1;
+	    rela->type == R_PPC64_REL64 || rela->type == R_PPC64_ENTRY)
+		return false;
 
 	/*
-	 * Nested functions used as callbacks are a special case.
-	 * They are not supposed to be visible outside of the
-	 * function that defines them.  Their names may differ in
-	 * the original and the patched kernels which makes it
-	 * difficult to use dynrelas.  Fortunately, nested functions
-	 * are rare and are unlikely to be used as asynchronous
-	 * callbacks, so the patched code can refer to them directly.
-	 * It seems, one can only distinguish such functions by their
-	 * names containing a dot.  Other kinds of functions with
-	 * such names (e.g. optimized copies of functions) are
-	 * unlikely to be used as callbacks.
+	 * On powerpc, the function prologue generated by GCC 6 has the
+	 * sequence:
+	 *
+	 *	.globl my_func
+	 *	.type my_func, @function
+	 *	.quad .TOC.-my_func
+	 * my_func:
+	 *	.reloc ., R_PPC64_ENTRY ; optional
+	 *	ld r2,-8(r12)
+	 *	add r2,r2,r12
+	 *	.localentry my_func, .-my_func
+	 *
+	 * The R_PPC64_ENTRY is optional and its symbol might have an empty
+	 * name.  Leave it as a normal rela.
 	 */
-	return (function_ptr_rela(rela) &&
-		toc_rela(rela)->sym->status != NEW &&
-		!strchr(toc_rela(rela)->sym->name, '.'));
+	if (rela->type == R_PPC64_ENTRY)
+		return false;
+
+	/*
+	 * Allow references to core module symbols to remain as normal
+	 * relas.  They should be exported.
+	 */
+	if (kpatch_is_core_module_symbol(rela->sym->name))
+		return false;
+
+	if (rela->sym->sec) {
+		/*
+		 * Internal symbols usually don't need dynrelas, because they
+		 * live in the patch module and can be relocated normally.
+		 *
+		 * There's one exception: function pointers.
+		 *
+		 * If the rela references a function pointer, we convert it to
+		 * a dynrela, so that the function pointer will refer to the
+		 * original function rather than the patched function.  This
+		 * can prevent crashes in cases where the function pointer is
+		 * called asynchronously after the patch module has been
+		 * unloaded.
+		 */
+		if (!function_ptr_rela(rela))
+			return false;
+
+		/*
+		 * Function pointers which refer to _nested_ functions are a
+		 * special case.  They are not supposed to be visible outside
+		 * of the function that defines them.  Their names may differ
+		 * in the original and the patched kernels which makes it
+		 * difficult to use dynrelas.  Fortunately, nested functions
+		 * are rare and are unlikely to be used as asynchronous
+		 * callbacks, so the patched code can refer to them directly.
+		 * It seems, one can only distinguish such functions by their
+		 * names containing a dot.  Other kinds of functions with such
+		 * names (e.g. optimized copies of functions) are unlikely to
+		 * be used as callbacks.
+		 *
+		 * Function pointers to *new* functions don't have this issue,
+		 * just use a normal rela for them.
+		 */
+		return toc_rela(rela)->sym->status != NEW &&
+			!strchr(toc_rela(rela)->sym->name, '.');
+	}
+
+	if (!lookup_symbol(table, rela->sym->name, &symbol)) {
+		/*
+		 * Assume the symbol lives in another .o in the patch module.
+		 * A normal rela should work.
+		 */
+		return false;
+	}
+
+	if (rela->sym->bind == STB_LOCAL) {
+
+		if (symbol.global)
+			ERROR("can't find local symbol '%s' in symbol table",
+			      rela->sym->name);
+
+		/*
+		 * The symbol is (formerly) local.  Use a dynrela to access the
+		 * original version of the symbol in the patched object.
+		 */
+		return true;
+	}
+
+	if (symbol.exported) {
+
+		if (is_gcc6_localentry_bundled_sym(rela->sym)) {
+			/*
+			 * On powerpc, the symbol is global and exported, but
+			 * it was also in the changed object file.  In this
+			 * case the rela refers to the 'localentry' point, so a
+			 * normal rela wouldn't work.  Force a dynrela so it
+			 * can be handled correctly by the livepatch relocation
+			 * code.
+			 */
+			return true;
+		}
+
+		if (!strcmp(symbol.objname, "vmlinux")) {
+			/*
+			 * The symbol is exported by vmlinux.  Use a normal
+			 * rela.
+			 */
+			return false;
+		}
+
+		/*
+		 * The symbol is exported by the to-be-patched module, or by
+		 * another module which the patched module depends on.  Use a
+		 * dynrela because of late module loading: the patch module may
+		 * be loaded before the to-be-patched (or other) module.
+		 */
+		return true;
+	}
+
+	if (symbol.global) {
+		/*
+		 * The symbol is global in the to-be-patched object, but not
+		 * exported.  Use a dynrela to work around the fact that it's
+		 * an unexported sybmbol.
+		 */
+		return true;
+	}
+
+	/*
+	 * The symbol is global and not exported, but it's not in the parent
+	 * object.  The only explanation is that it's defined in another object
+	 * in the patch module.  A normal rela should resolve it.
+	 */
+	return false;
 }
 
+/*
+ * kpatch_create_intermediate_sections()
+ *
+ * The primary purpose of this function is to convert some relas (also known as
+ * relocations) to dynrelas (also known as dynamic relocations or livepatch
+ * relocations or klp relas).
+ *
+ * If the patched code refers to a symbol, for example, if it calls a function
+ * or stores a pointer to a function somewhere or accesses some global data,
+ * the address of that symbol must be resolved somehow before the patch is
+ * applied.
+ *
+ * If the symbol lives outside the patch module, and if it's not exported by
+ * vmlinux (e.g., with EXPORT_SYMBOL) then the rela needs to be converted to a
+ * dynrela so the livepatch code can resolve it at runtime.
+ */
 static void kpatch_create_intermediate_sections(struct kpatch_elf *kelf,
 						struct lookup_table *table,
 						char *objname,
@@ -2758,9 +3034,8 @@ static void kpatch_create_intermediate_sections(struct kpatch_elf *kelf,
 	struct symbol *strsym, *ksym_sec_sym;
 	struct kpatch_symbol *ksyms;
 	struct kpatch_relocation *krelas;
-	struct lookup_result result;
-	char *sym_objname;
-	int ret, vmlinux, external;
+	struct lookup_result symbol;
+	bool vmlinux;
 
 	vmlinux = !strcmp(objname, "vmlinux");
 
@@ -2772,25 +3047,22 @@ static void kpatch_create_intermediate_sections(struct kpatch_elf *kelf,
 		if (!strcmp(sec->name, ".rela.kpatch.funcs"))
 			continue;
 		list_for_each_entry(rela, &sec->relas, list) {
-			nr++; /* upper bound on number of kpatch relas and symbols */
+
+			/* upper bound on number of kpatch relas and symbols */
+			nr++;
+
 			/*
-			 * Relocation section '.rela.toc' at offset 0xcc6b0 contains 46 entries:
-			 * ...
-			 * 0000000000000138  0000002a00000026 R_PPC64_ADDR64      0000000000000000 .text.deferred_put_nlk_sk + 8
+			 * We set 'need_dynrela' here in the first pass because
+			 * the .toc section's 'need_dynrela' values are
+			 * dependent on all the other sections.  Otherwise, if
+			 * we did this analysis in the second pass, we'd have
+			 * to convert .toc dynrelas at the very end.
 			 *
-			 * Relocation section '.rela.text.netlink_release' at offset 0xcadf0 contains 44 entries:
-			 * ...
-			 * 0000000000000398  0000007300000032 R_PPC64_TOC16_HA    0000000000000000 .toc + 138
-			 * 00000000000003a0  0000007300000040 R_PPC64_TOC16_LO_DS 0000000000000000 .toc + 138
-			 *
-			 * On PowerPC, may_need_dynrela() should be using rela's reference in .rela.toc for
-			 * the rela like in the example, where the sym name is .toc + offset. In such case,
-			 * the checks are performed on both rela and its reference in .rela.toc. Where the
-			 * rela is checked for rela->type and its corresponding rela in .rela.toc for function
-			 * pointer/switch label. If rela->need_dynrela needs to be set, it's referenced rela
-			 * in (.rela.toc)->need_dynrela is set, as they represent the function sym.
+			 * Specifically, this is needed for the powerpc
+			 * internal symbol function pointer check which is done
+			 * via .toc indirection in need_dynrela().
 			 */
-			if (may_need_dynrela(rela))
+			if (need_dynrela(table, rela))
 				toc_rela(rela)->need_dynrela = 1;
 		}
 	}
@@ -2829,138 +3101,21 @@ static void kpatch_create_intermediate_sections(struct kpatch_elf *kelf,
 			if (!rela->need_dynrela)
 				continue;
 
-			/*
-			 * Allow references to core module symbols to remain as
-			 * normal relas, since the core module may not be
-			 * compiled into the kernel, and they should be
-			 * exported anyway.
-			 */
-			if (kpatch_is_core_module_symbol(rela->sym->name))
-				continue;
+			if (!lookup_symbol(table, rela->sym->name, &symbol))
+				ERROR("can't find symbol '%s' in symbol table",
+				      rela->sym->name);
 
-			external = 0;
-			/*
-			 * sym_objname is the name of the object to which
-			 * rela->sym belongs. We'll need this to build
-			 * ".klp.sym." symbol names later on.
-			 *
-			 * By default sym_objname is the name of the
-			 * component being patched (vmlinux or module).
-			 * If it's an external symbol, sym_objname
-			 * will get reassigned appropriately.
-			 */
-			sym_objname = objname;
-
-			/*
-			 * On ppc64le, the function prologue generated by GCC 6
-			 * has the sequence:
-			 *
-			 *	.globl my_func
-			 *	.type my_func, @function
-			 *	.quad .TOC.-my_func
-			 * my_func:
-			 *	.reloc ., R_PPC64_ENTRY ; optional
-			 *	ld r2,-8(r12)
-			 *	add r2,r2,r12
-			 *	.localentry my_func, .-my_func
-			 *
-			 * The R_PPC64_ENTRY is optional and its symbol might
-			 * have an empty name.  Leave it as a normal rela.
-			 */
-			if (rela->type == R_PPC64_ENTRY)
-				continue;
-
-			if (rela->sym->bind == STB_LOCAL) {
-				/* An unchanged local symbol */
-				ret = lookup_local_symbol(table,
-					rela->sym->name, &result);
-				if (ret)
-					ERROR("lookup_local_symbol %s needed for %s",
-					      rela->sym->name, sec->base->name);
-
-			}
-			else if (vmlinux) {
-				/*
-				 * We have a patch to vmlinux which references
-				 * a global symbol.  Use a normal rela for
-				 * exported symbols and a dynrela otherwise.
-				 */
-#ifdef __powerpc64__
-				/*
-				 * An exported symbol might be local to an
-				 * object file and any access to the function
-				 * might be through localentry (toc+offset)
-				 * instead of global offset.
-				 *
-				 * fs/proc/proc_sysctl::sysctl_head_grab:
-				 * 166: 0000000000000000   256 FUNC    GLOBAL DEFAULT [<localentry>: 8]    42 unregister_sysctl_table
-				 * 167: 0000000000000000     0 NOTYPE  GLOBAL DEFAULT  UND .TOC.
-				 *
-				 * These type of symbols have a type of
-				 * STT_FUNC.  Treat them like local symbols.
-				 * They will be handled by the livepatch
-				 * relocation code.
-				 */
-				if (lookup_is_exported_symbol(table, rela->sym->name)) {
-					if (rela->sym->type != STT_FUNC)
-						continue;
-				}
-#else
-				if (lookup_is_exported_symbol(table, rela->sym->name))
-					continue;
-#endif
-				/*
-				 * If lookup_global_symbol() fails, assume the
-				 * symbol is defined in another object in the
-				 * patch module.
-				 */
-				if (lookup_global_symbol(table, rela->sym->name,
-							 &result))
-					continue;
-			} else {
-				/*
-				 * We have a patch to a module which references
-				 * a global symbol.  Try to find the symbol in
-				 * the module being patched.
-				 */
-				if (lookup_global_symbol(table, rela->sym->name,
-							 &result)) {
-					/*
-					 * Not there, see if the symbol is
-					 * exported, and set sym_objname to the
-					 * object the exported symbol belongs
-					 * to. If it's not exported, assume sym
-					 * is provided by another .o in the
-					 * patch module.
-					 */
-					sym_objname = lookup_exported_symbol_objname(table, rela->sym->name);
-					if (!sym_objname)
-						sym_objname = pmod_name;
-
-					/*
-					 * For a symbol exported by vmlinux, use
-					 * the original rela.
-					 *
-					 * For a symbol exported by a module,
-					 * convert to a dynrela because the
-					 * module might not be loaded yet.
-					 */
-					if (!strcmp(sym_objname, "vmlinux"))
-						continue;
-
-					external = 1;
-				}
-			}
-			log_debug("lookup for %s @ 0x%016lx len %lu\n",
-			          rela->sym->name, result.value, result.size);
+			log_debug("lookup for %s: obj=%s sympos=%lu",
+			          rela->sym->name, symbol.objname,
+				  symbol.sympos);
 
 			/* Fill in ksyms[index] */
 			if (vmlinux)
-				ksyms[index].src = result.value;
+				ksyms[index].src = symbol.addr;
 			else
 				/* for modules, src is discovered at runtime */
 				ksyms[index].src = 0;
-			ksyms[index].pos = result.pos;
+			ksyms[index].sympos = symbol.sympos;
 			ksyms[index].type = rela->sym->type;
 			ksyms[index].bind = rela->sym->bind;
 
@@ -2976,7 +3131,7 @@ static void kpatch_create_intermediate_sections(struct kpatch_elf *kelf,
 			ALLOC_LINK(rela2, &ksym_sec->rela->relas);
 			rela2->sym = strsym;
 			rela2->type = ABSOLUTE_RELA_TYPE;
-			rela2->addend = offset_of_string(&kelf->strings, sym_objname);
+			rela2->addend = offset_of_string(&kelf->strings, symbol.objname);
 			rela2->offset = (unsigned int)(index * sizeof(*ksyms) + \
 					offsetof(struct kpatch_symbol, objname));
 
@@ -2986,7 +3141,7 @@ static void kpatch_create_intermediate_sections(struct kpatch_elf *kelf,
 				rela->addend -= rela->sym->sym.st_value;
 			krelas[index].addend = rela->addend;
 			krelas[index].type = rela->type;
-			krelas[index].external = external;
+			krelas[index].external = !vmlinux && symbol.exported;
 
 			/* add rela to fill in krelas[index].dest field */
 			ALLOC_LINK(rela2, &krela_sec->rela->relas);
@@ -3462,10 +3617,11 @@ int main(int argc, char *argv[])
 	kpatch_elf_teardown(kelf_patched);
 
 	/* create symbol lookup table */
-	lookup = lookup_open(parent_symtab, mod_symvers, hint, base_locals);
-	for (sym_comp = base_locals; sym_comp && sym_comp->name; sym_comp++) {
+	lookup = lookup_open(parent_symtab, parent_name, mod_symvers, hint,
+			     base_locals);
+
+	for (sym_comp = base_locals; sym_comp && sym_comp->name; sym_comp++)
 		free(sym_comp->name);
-	}
 	free(base_locals);
 	free(hint);
 
