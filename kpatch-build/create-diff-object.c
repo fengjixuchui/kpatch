@@ -2135,7 +2135,7 @@ static bool should_keep_jump_label(struct lookup_table *lookup,
 				   unsigned int group_size,
 				   int *jump_labels_found)
 {
-	struct rela *code, *key, *rela;
+	struct rela *code = NULL, *key = NULL, *rela;
 	bool tracepoint = false, dynamic_debug = false;
 	struct lookup_result symbol;
 	int i = 0;
@@ -2156,7 +2156,7 @@ static bool should_keep_jump_label(struct lookup_table *lookup,
 		}
 	}
 
-	if (i != 3)
+	if (i != 3 || !key || !code)
 		ERROR("BUG: __jump_table has an unexpected format");
 
 	if (!strncmp(key->sym->name, "__tracepoint_", 13))
@@ -3796,7 +3796,7 @@ int main(int argc, char *argv[])
 	kpatch_create_strtab(kelf_out);
 	kpatch_create_symtab(kelf_out);
 	kpatch_dump_kelf(kelf_out);
-	kpatch_write_output_elf(kelf_out, kelf_patched->elf, output_obj);
+	kpatch_write_output_elf(kelf_out, kelf_patched->elf, output_obj, 0664);
 
 	lookup_close(lookup);
 	kpatch_elf_free(kelf_patched);
